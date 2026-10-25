@@ -1,0 +1,31 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;500;600;700&family=Unbounded:wght@400;500;600;700&display=swap');
+
+:root {
+  font-family: 'Albert Sans', sans-serif;
+  color: #F5F3F0;
+  background-color: #171717;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+h1 {
+  font-family: 'Unbounded', sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: aftertone
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: AFTERTONE_DB
+        value: /tmp/aftertone.db
+      - key: AFTERTONE_MODEL
+        value: /tmp/recommender_model.json
+      - key: FRONTEND_URL
+        value: https://aftertone.onrender.com
+      - key: FRONTEND_ORIGINS
+        value: https://aftertone.onrender.com
+      - key: SPOTIFY_REDIRECT_URI
+        value: https://aftertone.onrender.com/callback
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false

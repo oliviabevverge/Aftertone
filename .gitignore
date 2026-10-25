@@ -1,0 +1,9 @@
+.env
+.venv/
+.venv-*/
+node_modules/
+frontend/dist/
+backend/data/*.db
+backend/data/recommender_model.json
+__pycache__/
+*.py[cod]

@@ -1,0 +1,382 @@
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from app.recommender import recommend
+from app.store import DEFAULT_SETTINGS, ListeningStore
+from train_model import train
+
+
+def play(
+    track_id: str,
+    hours_ago: float,
+    *,
+    place_id: int | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    hour: int | None = None,
+    weekday_offset: int = 0,
+) -> dict:
+    now = datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)  # Thursday morning
+    played = now - timedelta(hours=hours_ago, days=weekday_offset)
+    if hour is not None:
+        played = played.replace(hour=hour, minute=0)
+    return {
+        "id": 1,
+        "track_id": track_id,
+        "name": track_id.replace("-", " ").title(),
+        "artists": ["Artist"],
+        "album": "Album",
+        "image": None,
+        "url": None,
+        "played_at": played.isoformat().replace("+00:00", "Z"),
+        "place_id": place_id,
+        "latitude": latitude,
+        "longitude": longitude,
+    }
+
+
+class RecommenderTests(unittest.TestCase):
+    def test_artist_frequency_helps_automatic_ranking(self) -> None:
+        history = [
+            {**play("familiar-song", 48), "artists": ["Familiar Artist"]},
+            {**play("other-song", 30), "artists": ["Other Artist"]},
+            {**play("familiar-song", 24), "artists": ["Familiar Artist"]},
+            {**play("familiar-song", 12), "artists": ["Familiar Artist"]},
+            {**play("seed", 1), "artists": ["Seed Artist"]},
+        ]
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update(
+            {
+                "sequence_weight": 0,
+                "time_weight": 0,
+                "location_weight": 0,
+                "recency_weight": 0,
+                "novelty_weight": 0,
+                "exclude_last_n": 0,
+            }
+        )
+
+        results = recommend(
+            history,
+            settings,
+            hour=8,
+            weekday=3,
+            seed_track_ids=["seed"],
+            now=datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(results[0]["track"]["id"], "familiar-song")
+        self.assertGreater(results[0]["parts"]["artist"], results[1]["parts"]["artist"])
+
+    def test_sequence_and_morning_home_context(self) -> None:
+        home = 1
+        gym = 2
+        history = [
+            play("opener", 24 * 7, place_id=home, latitude=40.7, longitude=-74.0, hour=8),
+            play("morning-hit", 24 * 7 - 0.05, place_id=home, latitude=40.7, longitude=-74.0, hour=8),
+            play("gym-start", 24 * 3, place_id=gym, latitude=40.76, longitude=-73.98, hour=18),
+            play("gym-drop", 24 * 3 - 0.05, place_id=gym, latitude=40.76, longitude=-73.98, hour=18),
+            play("opener", 2, place_id=home, latitude=40.7, longitude=-74.0, hour=8),
+        ]
+        settings = dict(DEFAULT_SETTINGS)
+        settings["exclude_last_n"] = 1
+        results = recommend(
+            history,
+            settings,
+            hour=8.1,
+            weekday=3,
+            place_id=home,
+            latitude=40.7,
+            longitude=-74.0,
+            seed_track_ids=["opener"],
+            now=datetime(2026, 10, 15, 8, 10, tzinfo=timezone.utc),
+        )
+        top_ids = [item["track"]["id"] for item in results]
+        self.assertEqual(top_ids[0], "morning-hit")
+        self.assertIn("follows", results[0]["why"])
+
+    def test_settings_can_emphasize_location_over_sequence(self) -> None:
+        history = [
+            play("seed", 10, place_id=1, hour=9),
+            play("sequence-next", 9.9, place_id=1, hour=9),
+            play("place-song", 20, place_id=2, hour=21),
+        ]
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update(
+            {
+                "sequence_weight": 0.0,
+                "time_weight": 0.0,
+                "location_weight": 2.0,
+                "recency_weight": 0.0,
+                "novelty_weight": 0.0,
+                "exclude_last_n": 0,
+            }
+        )
+        results = recommend(
+            history,
+            settings,
+            hour=21,
+            weekday=3,
+            place_id=2,
+            seed_track_ids=["seed"],
+            now=datetime(2026, 10, 15, 21, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(results[0]["track"]["id"], "place-song")
+
+    def test_time_context_uses_the_users_local_timezone(self) -> None:
+        seed = play("seed", 72)
+        morning = play("morning-song", 48)
+        evening = play("evening-song", 96)
+        seed["played_at"] = "2026-10-08T11:55:00Z"
+        morning["played_at"] = "2026-10-08T12:00:00Z"
+        evening["played_at"] = "2026-10-08T00:00:00Z"
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update(
+            {
+                "sequence_weight": 0.0,
+                "time_weight": 1.0,
+                "location_weight": 0.0,
+                "recency_weight": 0.0,
+                "novelty_weight": 0.0,
+                "exclude_last_n": 0,
+            }
+        )
+
+        results = recommend(
+            [seed, morning, evening],
+            settings,
+            hour=8,
+            weekday=3,
+            timezone_offset_minutes=240,
+            seed_track_ids=["seed"],
+            now=datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(results[0]["track"]["id"], "morning-song")
+
+
+class StoreTests(unittest.TestCase):
+    def test_upsert_and_place_assignment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = ListeningStore(Path(tmp) / "aftertone.db")
+            store.upsert_plays(
+                [
+                    {
+                        "id": "track-a",
+                        "name": "Track A",
+                        "artists": ["A"],
+                        "album": "LP",
+                        "image": None,
+                        "url": None,
+                        "played_at": "2026-10-15T12:00:00Z",
+                    }
+                ]
+            )
+            store.upsert_plays(
+                [
+                    {
+                        "id": "track-a",
+                        "name": "Track A",
+                        "artists": ["A"],
+                        "album": "LP",
+                        "image": None,
+                        "url": None,
+                        "played_at": "2026-10-15T12:00:00Z",
+                    }
+                ]
+            )
+            self.assertEqual(len(store.list_plays()), 1)
+            place = store.create_place("Home", 40.7, -74.0, 0.5)
+            tagged = store.assign_place(store.list_plays()[0]["id"], place["id"])
+            self.assertEqual(tagged["place_name"], "Home")
+            self.assertIsNone(tagged["latitude"])
+            self.assertIsNone(tagged["longitude"])
+            settings = store.update_settings({"sequence_weight": 2.0})
+            self.assertEqual(settings["sequence_weight"], 2.0)
+
+    def test_location_stats_filter_genres_and_estimated_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = ListeningStore(Path(tmp) / "aftertone.db")
+            store.upsert_plays(
+                [
+                    {
+                        "id": "gym-track",
+                        "name": "Gym Track",
+                        "artists": ["Artist"],
+                        "artist_ids": ["artist-id"],
+                        "duration_ms": 210000,
+                        "album": "Album",
+                        "image": None,
+                        "url": None,
+                        "played_at": "2026-10-15T12:00:00Z",
+                    },
+                    {
+                        "id": "work-track",
+                        "name": "Work Track",
+                        "artists": ["Artist"],
+                        "artist_ids": ["artist-id"],
+                        "duration_ms": 180000,
+                        "album": "Album",
+                        "image": None,
+                        "url": None,
+                        "played_at": "2026-10-15T13:00:00Z",
+                    },
+                ]
+            )
+            gym = store.create_place("Gym", 40.0, -74.0)
+            gym_play = next(play for play in store.list_plays() if play["track_id"] == "gym-track")
+            store.assign_place(gym_play["id"], gym["id"])
+            store.save_artist_genres(
+                [{"id": "artist-id", "name": "Artist", "genres": ["indie rock"]}]
+            )
+
+            stats = store.listening_stats(
+                timezone.utc,
+                f"place:{gym['id']}",
+                store.artist_genres(),
+            )
+
+            self.assertEqual(stats["play_count"], 1)
+            self.assertEqual(stats["context"]["name"], "Gym")
+            self.assertEqual(stats["estimated_full_track_minutes"], 3.5)
+            self.assertEqual(stats["top_genres"], [{"name": "indie rock", "play_count": 1}])
+            self.assertEqual(stats["top_tracks"][0]["id"], "gym-track")
+
+    def test_stats_support_date_range_and_custom_work_schedule(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = ListeningStore(Path(tmp) / "aftertone.db")
+            store.upsert_plays(
+                [
+                    {
+                        "id": "today",
+                        "name": "Today",
+                        "artists": ["Artist"],
+                        "album": "Album",
+                        "image": None,
+                        "url": None,
+                        "played_at": datetime.now(timezone.utc)
+                        .replace(hour=14, minute=0, second=0, microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                    },
+                    {
+                        "id": "old",
+                        "name": "Old",
+                        "artists": ["Artist"],
+                        "album": "Album",
+                        "image": None,
+                        "url": None,
+                        "played_at": "2020-01-01T14:00:00Z",
+                    },
+                ]
+            )
+            stats = store.listening_stats(
+                timezone.utc,
+                days=7,
+                work_start_hour=13,
+                work_end_hour=15,
+                work_weekdays=list(range(7)),
+            )
+            self.assertEqual(stats["days"], 7)
+            self.assertEqual(stats["play_count"], 1)
+            self.assertEqual(stats["contexts"], [{"name": "Work hours", "play_count": 1}])
+
+    def test_live_location_sync_only_tags_plays_at_saved_places(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = ListeningStore(Path(tmp) / "aftertone.db")
+            place = store.create_place("Home", 40.7, -74.0, 0.5)
+            tracks = [
+                {
+                    "id": "track-a",
+                    "name": "Track A",
+                    "artists": ["A"],
+                    "album": "LP",
+                    "image": None,
+                    "url": None,
+                    "played_at": "2026-10-15T12:00:00Z",
+                }
+            ]
+
+            tagged = store.sync_plays_with_location(tracks, 40.701, -74.0)
+            self.assertEqual(tagged["inserted"], 1)
+            self.assertEqual(tagged["tagged"], 1)
+            self.assertEqual(tagged["place"]["id"], place["id"])
+            saved_play = store.list_plays()[0]
+            self.assertEqual(saved_play["place_id"], place["id"])
+            self.assertIsNone(saved_play["latitude"])
+            self.assertIsNone(saved_play["longitude"])
+
+            duplicate = store.sync_plays_with_location(tracks, 40.701, -74.0)
+            self.assertEqual(duplicate["inserted"], 0)
+            self.assertEqual(duplicate["tagged"], 0)
+
+            outside_place = store.sync_plays_with_location(
+                [
+                    {
+                        **tracks[0],
+                        "id": "track-b",
+                        "played_at": "2026-10-15T12:03:00Z",
+                    }
+                ],
+                41.0,
+                -73.0,
+            )
+            self.assertEqual(outside_place["inserted"], 1)
+            self.assertEqual(outside_place["tagged"], 0)
+            self.assertIsNone(store.list_plays()[0]["place_id"])
+
+    def test_feedback_dataset_trains_and_saves_temporal_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "aftertone.db"
+            model_path = Path(tmp) / "model.json"
+            store = ListeningStore(db_path)
+            for session_number in range(10):
+                session_id = f"session-{session_number}"
+                context = {
+                    "hour": 8 + session_number % 12,
+                    "weekday": session_number % 7,
+                    "place_id": 1 if session_number % 2 else None,
+                    "seed_track_ids": ["seed"],
+                }
+                candidates = [
+                    {
+                        "track": {"id": f"positive-{session_number}", "name": "Positive"},
+                        "parts": {
+                            "sequence": 0.9,
+                            "time": 0.8,
+                            "location": 0.6,
+                            "recency": 0.7,
+                            "novelty_penalty": 0.0,
+                        },
+                        "score": 1.0,
+                    },
+                    {
+                        "track": {"id": f"negative-{session_number}", "name": "Negative"},
+                        "parts": {
+                            "sequence": 0.1,
+                            "time": 0.2,
+                            "location": 0.0,
+                            "recency": 0.3,
+                            "novelty_penalty": 0.7,
+                        },
+                        "score": 0.2,
+                    },
+                ]
+                store.record_recommendations(session_id, context, candidates)
+                store.record_recommendation_feedback(
+                    session_id, f"positive-{session_number}", "liked"
+                )
+                store.record_recommendation_feedback(
+                    session_id, f"negative-{session_number}", "not_for_me"
+                )
+
+            model = train(db_path, model_path)
+            self.assertEqual(model["examples"], {"total": 20, "train": 16, "test": 4})
+            self.assertIn("ndcg_at_5", model["metrics"])
+            self.assertTrue(model_path.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
