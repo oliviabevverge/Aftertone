@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 .venv-*/
 node_modules/
@@ -7,3 +9,10 @@ backend/data/*.db
 backend/data/recommender_model.json
 __pycache__/
 *.py[cod]
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/

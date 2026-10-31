@@ -472,7 +472,8 @@ section h2 {
 }
 
 .context-place select,
-.place-coordinate-form input {
+.place-coordinate-form input,
+.profile-editor textarea {
   width: 100%;
   border: 1px solid #393636;
   border-radius: 8px;
@@ -485,6 +486,30 @@ section h2 {
   display: grid;
   gap: 0.75rem;
   margin: 1.25rem 0;
+}
+
+.profile-setup {
+  max-width: 42rem;
+  margin: 1rem 0;
+  color: #A9A5A2;
+}
+
+.profile-setup > p {
+  line-height: 1.5;
+}
+
+.profile-editor {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.85rem 0;
+}
+
+.profile-editor textarea {
+  min-height: 5rem;
+  resize: vertical;
+  background: #171717;
+  color: #F5F3F0;
+  font: inherit;
 }
 
 .recommendation-card {

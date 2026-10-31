@@ -1,7 +1,9 @@
 import os
+import hashlib
 import secrets
 import time
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,25 +20,35 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.learned_ranker import add_search_affinity, load_model, rank_with_model
-from app.recommender import recommend
+from app.recommender import recommend, rerank_with_listening_profile
 from app.store import ListeningStore, parse_played_at
 
 load_dotenv()
 
 SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_ME_URL = "https://api.spotify.com/v1/me"
 SPOTIFY_RECENTLY_PLAYED_URL = "https://api.spotify.com/v1/me/player/recently-played"
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 SPOTIFY_ARTISTS_URL = "https://api.spotify.com/v1/artists"
 STATE_COOKIE = "aftertone_oauth_state"
 SESSION_COOKIE = "aftertone_session"
 sessions: dict[str, dict[str, Any]] = {}
+if (
+    os.getenv("AFTERTONE_REQUIRE_DATABASE", "").lower() == "true"
+    and not os.getenv("DATABASE_URL")
+):
+    raise RuntimeError("DATABASE_URL is required for this deployment.")
 store = ListeningStore(
-    os.getenv(
+    os.getenv("DATABASE_URL")
+    or os.getenv(
         "AFTERTONE_DB",
         str(Path(__file__).resolve().parent.parent / "data" / "aftertone.db"),
-    )
+    ),
+    schema="aftertone_default",
 )
+_account_stores: dict[str, ListeningStore] = {}
+_account_stores_lock = threading.Lock()
 
 app = FastAPI()
 app.add_middleware(
@@ -66,6 +78,70 @@ def spotify_config() -> tuple[str, str, str]:
 
 def frontend_url() -> str:
     return os.getenv("FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
+
+
+def account_store(spotify_user_id: str) -> ListeningStore:
+    with _account_stores_lock:
+        if spotify_user_id not in _account_stores:
+            database_url = os.getenv("DATABASE_URL")
+            default_db = Path(
+                os.getenv(
+                    "AFTERTONE_DB",
+                    str(Path(__file__).resolve().parent.parent / "data" / "aftertone.db"),
+                )
+            )
+            root = Path(
+                os.getenv("AFTERTONE_ACCOUNT_DB_DIR", str(default_db.parent / "accounts"))
+            )
+            account_key = hashlib.sha256(spotify_user_id.encode("utf-8")).hexdigest()
+            account_db = root / f"{account_key}.db"
+            legacy_owner = os.getenv("AFTERTONE_LEGACY_OWNER_ID")
+            if not database_url and (
+                not account_db.exists()
+                and legacy_owner == spotify_user_id
+                and default_db.exists()
+            ):
+                root.mkdir(parents=True, exist_ok=True)
+                source = sqlite3.connect(default_db)
+                target = sqlite3.connect(account_db)
+                try:
+                    source.backup(target)
+                finally:
+                    source.close()
+                    target.close()
+            if database_url:
+                _account_stores[spotify_user_id] = ListeningStore(
+                    database_url,
+                    schema=f"aftertone_{account_key[:32]}",
+                )
+            else:
+                _account_stores[spotify_user_id] = ListeningStore(account_db)
+        return _account_stores[spotify_user_id]
+
+
+def store_for_request(request: Request) -> ListeningStore:
+    session = current_session(request)
+    spotify_user_id = session.get("spotify_user_id")
+    if not spotify_user_id:
+        return store
+    return account_store(spotify_user_id)
+
+
+def authorize_spotify_user(spotify_user_id: str) -> None:
+    allowlist_value = os.getenv("AFTERTONE_ALLOWED_SPOTIFY_USERS", "")
+    allowed_users = {
+        user_id.strip()
+        for user_id in allowlist_value.split(",")
+        if user_id.strip()
+    }
+    if spotify_user_id in allowed_users:
+        return
+    if not allowed_users and os.getenv("AFTERTONE_REQUIRE_ALLOWLIST", "").lower() != "true":
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="This Aftertone preview is invite-only. Ask the owner to add your Spotify account.",
+    )
 
 
 def exchange_code(code: str) -> dict[str, Any]:
@@ -179,6 +255,14 @@ def current_session(request: Request) -> dict[str, Any]:
             status_code=401,
             detail="Spotify is not connected. Connect your account to continue.",
         )
+    spotify_user_id = session.get("spotify_user_id")
+    if spotify_user_id:
+        authorize_spotify_user(spotify_user_id)
+    elif os.getenv("AFTERTONE_REQUIRE_ALLOWLIST", "").lower() == "true":
+        raise HTTPException(
+            status_code=401,
+            detail="This account session is missing its Spotify account identity. Reconnect Spotify.",
+        )
     return session
 
 
@@ -219,11 +303,24 @@ class RecommenderSettings(BaseModel):
     search_logging_enabled: bool | None = None
 
 
+class PreferredTrack(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    artist: str = Field(min_length=1, max_length=200)
+
+
+class ListeningProfilesUpdate(BaseModel):
+    office: str = Field(default="", max_length=5000)
+    gym: str = Field(default="", max_length=5000)
+    car: str = Field(default="", max_length=5000)
+
+
 class RecommendRequest(BaseModel):
     hour: float | None = Field(default=None, ge=0, lt=24)
     weekday: int | None = Field(default=None, ge=0, le=6)
     timezone_offset_minutes: int = Field(default=0, ge=-840, le=840)
     place_id: int | None = None
+    listening_mode: Literal["office", "gym", "car"] | None = None
+    preferred_tracks: list[PreferredTrack] = Field(default_factory=list, max_length=30)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     seed_track_ids: list[str] = Field(default_factory=list, max_length=8)
@@ -280,7 +377,7 @@ def login() -> RedirectResponse:
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": "user-read-recently-played",
+        "scope": "user-read-private user-read-recently-played",
         "state": state,
     }
     response = RedirectResponse(f"{SPOTIFY_AUTHORIZE_URL}?{urlencode(params)}")
@@ -316,11 +413,19 @@ def callback(
 
     token = exchange_code(code)
     session_id = secrets.token_urlsafe(32)
-    sessions[session_id] = {
+    session = {
         "access_token": token["access_token"],
         "refresh_token": token.get("refresh_token"),
         "expires_at": time.time() + token.get("expires_in", 3600),
     }
+    spotify_user = spotify_get(SPOTIFY_ME_URL, session, {}, "your Spotify account")
+    spotify_user_id = spotify_user.get("id")
+    if not isinstance(spotify_user_id, str) or not spotify_user_id:
+        raise HTTPException(status_code=502, detail="Spotify did not return an account ID.")
+    authorize_spotify_user(spotify_user_id)
+    session["spotify_user_id"] = spotify_user_id
+    session["display_name"] = spotify_user.get("display_name") or ""
+    sessions[session_id] = session
     response = RedirectResponse(f"{frontend_url()}/?spotify_connected=1")
     response.delete_cookie(STATE_COOKIE)
     response.set_cookie(
@@ -328,7 +433,7 @@ def callback(
         session_id,
         max_age=30 * 24 * 60 * 60,
         httponly=True,
-        secure=os.getenv("SPOTIFY_REDIRECT_URI", "").startswith("https://"),
+        secure=spotify_config()[2].startswith("https://"),
         samesite="lax",
     )
     return response
@@ -341,6 +446,7 @@ def recently_played(
     days: int = Query(default=0, ge=0, le=30),
 ) -> dict[str, Any]:
     session = current_session(request)
+    store = store_for_request(request)
     tracks: list[dict[str, Any]] = []
     pages = 0
     has_more = False
@@ -427,7 +533,7 @@ def history(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     return {
         "plays": store.list_plays(limit=limit, offset=offset),
         "tracks": store.unique_tracks(),
@@ -443,6 +549,7 @@ def listening_stats(
     days: int = Query(default=0, ge=0, le=365),
 ) -> dict[str, Any]:
     session = current_session(request)
+    store = store_for_request(request)
     try:
         zone = ZoneInfo(time_zone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
@@ -492,7 +599,7 @@ def listening_stats(
 
 @app.get("/api/stats/settings")
 def get_listening_stats_settings(request: Request) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     return {"settings": store.stats_settings()}
 
 
@@ -501,7 +608,7 @@ def put_listening_stats_settings(
     request: Request,
     body: ListeningStatsSettings,
 ) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     if body.work_start_hour >= body.work_end_hour:
         raise HTTPException(status_code=422, detail="Work end hour must be later than start hour.")
     if len(set(body.work_weekdays)) != len(body.work_weekdays) or any(
@@ -516,7 +623,7 @@ def update_artist_genres(
     request: Request,
     body: ArtistGenresUpdate,
 ) -> dict[str, str]:
-    current_session(request)
+    store = store_for_request(request)
     genres = sorted({genre.strip().casefold() for genre in body.genres if genre.strip()})
     if any(len(genre) > 60 for genre in genres):
         raise HTTPException(status_code=422, detail="Each genre must be 60 characters or fewer.")
@@ -531,14 +638,14 @@ def favorites(
     request: Request,
     limit: int = Query(default=50, ge=1, le=50),
 ) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     since = datetime.now(timezone.utc) - timedelta(days=7)
     return {"period_days": 7, **store.most_listened_since(since, limit)}
 
 
 @app.get("/api/learning-status")
 def learning_status(request: Request) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     stats = store.feedback_stats()
     examples = store.training_examples()
     return {
@@ -550,12 +657,53 @@ def learning_status(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/api/account")
+def account(request: Request) -> dict[str, str]:
+    session = current_session(request)
+    spotify_user_id = session.get("spotify_user_id")
+    if not spotify_user_id:
+        raise HTTPException(status_code=401, detail="Spotify account identity is unavailable.")
+    return {
+        "spotify_user_id": spotify_user_id,
+        "display_name": session.get("display_name", ""),
+    }
+
+
+@app.get("/api/listening-profiles")
+def get_listening_profiles(request: Request) -> dict[str, dict[str, str]]:
+    store = store_for_request(request)
+    return {"profiles": store.listening_profiles()}
+
+
+@app.put("/api/listening-profiles")
+def put_listening_profiles(
+    request: Request,
+    body: ListeningProfilesUpdate,
+) -> dict[str, dict[str, str]]:
+    store = store_for_request(request)
+    profiles = body.model_dump()
+    for mode, value in profiles.items():
+        tracks = [line for line in value.splitlines() if line.strip()]
+        if len(tracks) > 30:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Add no more than 30 tracks to the {mode} profile.",
+            )
+        for line in tracks:
+            if " — " not in line or not all(part.strip() for part in line.rsplit(" — ", 1)):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Enter each preferred track as Song — Artist.",
+                )
+    return {"profiles": store.save_listening_profiles(profiles)}
+
+
 @app.post("/api/feedback")
 def recommendation_feedback(
     request: Request,
     body: RecommendationFeedback,
 ) -> dict[str, str]:
-    current_session(request)
+    store = store_for_request(request)
     if not store.record_recommendation_feedback(body.session_id, body.track_id, body.action):
         raise HTTPException(status_code=404, detail="That recommendation was not found.")
     return {"status": "recorded"}
@@ -564,6 +712,7 @@ def recommendation_feedback(
 @app.post("/api/spotify-search")
 def spotify_search(request: Request, body: SpotifySearchRequest) -> dict[str, Any]:
     session = current_session(request)
+    store = store_for_request(request)
     query = body.query.strip()
     if not query:
         raise HTTPException(status_code=422, detail="Enter a search query.")
@@ -603,7 +752,7 @@ def spotify_search(request: Request, body: SpotifySearchRequest) -> dict[str, An
 
 @app.post("/api/search-selection")
 def search_selection(request: Request, body: SearchSelection) -> dict[str, str]:
-    current_session(request)
+    store = store_for_request(request)
     if not store.select_search_result(body.search_id, body.track_id):
         raise HTTPException(status_code=404, detail="That search record was not found.")
     return {"status": "recorded"}
@@ -611,20 +760,20 @@ def search_selection(request: Request, body: SearchSelection) -> dict[str, str]:
 
 @app.delete("/api/search-history")
 def delete_search_history(request: Request) -> dict[str, str]:
-    current_session(request)
+    store = store_for_request(request)
     store.delete_search_events()
     return {"status": "deleted"}
 
 
 @app.get("/api/places")
 def places(request: Request) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     return {"places": store.list_places()}
 
 
 @app.post("/api/places")
 def create_place(request: Request, body: PlaceCreate) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     try:
         place = store.create_place(body.name, body.latitude, body.longitude, body.radius_km)
     except sqlite3.IntegrityError as exc:
@@ -634,14 +783,14 @@ def create_place(request: Request, body: PlaceCreate) -> dict[str, Any]:
 
 @app.delete("/api/places/{place_id}")
 def remove_place(request: Request, place_id: int) -> dict[str, str]:
-    current_session(request)
+    store = store_for_request(request)
     store.delete_place(place_id)
     return {"status": "ok"}
 
 
 @app.post("/api/plays/{play_id}/location")
 def update_play_location(request: Request, play_id: int, body: PlayLocationUpdate) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     play = store.assign_place(play_id, body.place_id, body.latitude, body.longitude)
     if play is None:
         raise HTTPException(status_code=404, detail="That play was not found.")
@@ -650,7 +799,7 @@ def update_play_location(request: Request, play_id: int, body: PlayLocationUpdat
 
 @app.post("/api/history/tag-location")
 def tag_recent_location(request: Request, body: ContextTag) -> dict[str, int]:
-    current_session(request)
+    store = store_for_request(request)
     updated = store.tag_recent_plays(body.latitude, body.longitude, body.within_hours)
     return {"updated": updated}
 
@@ -658,6 +807,7 @@ def tag_recent_location(request: Request, body: ContextTag) -> dict[str, int]:
 @app.post("/api/location/sync")
 def sync_live_location(request: Request, body: LiveLocationSync) -> dict[str, Any]:
     session = current_session(request)
+    store = store_for_request(request)
     result = spotify_get(
         SPOTIFY_RECENTLY_PLAYED_URL,
         session,
@@ -698,20 +848,21 @@ def sync_live_location(request: Request, body: LiveLocationSync) -> dict[str, An
 
 @app.get("/api/recommender/settings")
 def get_settings(request: Request) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     return {"settings": store.settings()}
 
 
 @app.put("/api/recommender/settings")
 def put_settings(request: Request, body: RecommenderSettings) -> dict[str, Any]:
-    current_session(request)
+    store = store_for_request(request)
     patch = body.model_dump(exclude_none=True)
     return {"settings": store.update_settings(patch)}
 
 
 @app.post("/api/recommendations")
 def recommendations(request: Request, body: RecommendRequest) -> dict[str, Any]:
-    current_session(request)
+    session = current_session(request)
+    store = store_for_request(request)
     now = datetime.now().astimezone()
     hour = body.hour if body.hour is not None else now.hour + now.minute / 60
     weekday = body.weekday if body.weekday is not None else now.weekday()
@@ -719,6 +870,7 @@ def recommendations(request: Request, body: RecommendRequest) -> dict[str, Any]:
         "hour": hour,
         "weekday": weekday,
         "place_id": body.place_id,
+        "listening_mode": body.listening_mode,
         "seed_track_ids": body.seed_track_ids,
     }
     results = recommend(
@@ -740,14 +892,28 @@ def recommendations(request: Request, body: RecommendRequest) -> dict[str, Any]:
             {**item, "parts": {**item["parts"], "search_affinity": 0.0}}
             for item in results
         ]
-    trained_model = load_model()
+    trained_model = load_model() if not session.get("spotify_user_id") else None
     results = rank_with_model(results, context, trained_model)
+    profile_tracks = [
+        track.model_dump()
+        for track in body.preferred_tracks
+        if track.name.strip() and track.artist.strip()
+    ]
+    results = rerank_with_listening_profile(
+        results,
+        profile_tracks,
+    )
+
     session_id = str(uuid.uuid4())
     store.record_recommendations(session_id, context, results)
     return {
         "session_id": session_id,
         "context": context,
-        "ranking_model": "trained logistic regression" if trained_model else "rule-based baseline",
+        "ranking_model": (
+            "trained logistic regression"
+            if trained_model
+            else "rule-based baseline"
+        ) + (" + listening profile" if profile_tracks else ""),
         "recommendations": results,
     }
 

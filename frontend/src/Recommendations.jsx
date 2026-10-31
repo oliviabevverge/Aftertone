@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+const LISTENING_MODES = [
+  { id: 'office', label: 'Office' },
+  { id: 'gym', label: 'Gym' },
+  { id: 'car', label: 'Car' },
+]
+
 function distanceKm(latitude1, longitude1, latitude2, longitude2) {
   const radians = (degrees) => (degrees * Math.PI) / 180
   const latitudeDelta = radians(latitude2 - latitude1)
@@ -22,6 +28,12 @@ function currentContext() {
 function Recommendations({ connected, historyVersion }) {
   const [places, setPlaces] = useState([])
   const [placeId, setPlaceId] = useState('')
+  const [listeningMode, setListeningMode] = useState('')
+  const [profileState, setProfileState] = useState({
+    profiles: { office: '', gym: '', car: '' },
+    error: '',
+  })
+  const profiles = profileState.profiles
   const [recommendations, setRecommendations] = useState([])
   const [sessionId, setSessionId] = useState('')
   const [feedback, setFeedback] = useState({})
@@ -30,6 +42,8 @@ function Recommendations({ connected, historyVersion }) {
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [savingProfiles, setSavingProfiles] = useState(false)
+  const [profileStatus, setProfileStatus] = useState('')
   const [locating, setLocating] = useState(false)
   const [liveTracking, setLiveTracking] = useState(false)
   const [locationStatus, setLocationStatus] = useState('')
@@ -37,6 +51,8 @@ function Recommendations({ connected, historyVersion }) {
   const [latitude, setLatitude] = useState('')
   const [longitude, setLongitude] = useState('')
   const selectedPlaceId = useRef('')
+  const selectedMode = useRef('')
+  const profilesRef = useRef(profileState.profiles)
 
   useEffect(() => {
     if (!connected) return
@@ -59,7 +75,10 @@ function Recommendations({ connected, historyVersion }) {
     return result
   }
 
-  const requestRecommendations = useCallback(async (nextPlaceId = selectedPlaceId.current) => {
+  const requestRecommendations = useCallback(async (
+    nextPlaceId = selectedPlaceId.current,
+    nextMode = selectedMode.current,
+  ) => {
     if (!connected) return
     setSessionId('')
     setLoading(true)
@@ -72,6 +91,18 @@ function Recommendations({ connected, historyVersion }) {
         body: JSON.stringify({
           ...currentContext(),
           place_id: nextPlaceId ? Number(nextPlaceId) : null,
+          listening_mode: nextMode || null,
+          preferred_tracks: (profilesRef.current[nextMode] || '')
+            .split('\n')
+            .map((line) => {
+              const separator = line.lastIndexOf(' — ')
+              if (separator < 1) return null
+              return {
+                name: line.slice(0, separator).trim(),
+                artist: line.slice(separator + 3).trim(),
+              }
+            })
+            .filter((track) => track?.name && track.artist),
           limit: 12,
         }),
       })
@@ -80,7 +111,7 @@ function Recommendations({ connected, historyVersion }) {
       setSessionId(result.session_id)
       setFeedback({})
       setStatus(result.recommendations.length
-        ? `Ranked automatically using song sequences, artist listening frequency, and time patterns (${result.ranking_model}).`
+        ? `Ranked using your listening history, time and place patterns${nextMode ? `, and your ${nextMode} profile` : ''} (${result.ranking_model}).`
         : 'Sync more listening history to reveal recurring sequences and patterns.')
     } catch (requestError) {
       setError(requestError.message)
@@ -89,6 +120,35 @@ function Recommendations({ connected, historyVersion }) {
       setLoading(false)
     }
   }, [connected])
+
+  function updateProfile(mode, value) {
+    const next = { ...profilesRef.current, [mode]: value }
+    profilesRef.current = next
+    setProfileState({ profiles: next, error: '' })
+    setProfileStatus('Unsaved changes')
+  }
+
+  async function saveProfiles() {
+    setSavingProfiles(true)
+    setError('')
+    setProfileStatus('')
+    try {
+      const response = await fetch('/api/listening-profiles', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profilesRef.current),
+      })
+      const result = await readJson(response, 'Could not save listening profiles.')
+      profilesRef.current = result.profiles
+      setProfileState({ profiles: result.profiles, error: '' })
+      setProfileStatus('Profiles saved to your account.')
+      await requestRecommendations()
+    } catch (saveError) {
+      setError(saveError.message)
+    } finally {
+      setSavingProfiles(false)
+    }
+  }
 
   function useCurrentLocation() {
     if (!navigator.geolocation) {
@@ -151,10 +211,16 @@ function Recommendations({ connected, historyVersion }) {
     let cancelled = false
     async function load() {
       try {
-        const response = await fetch('/api/places')
-        const result = await readJson(response, 'Could not load saved places.')
+        const [placesResponse, profilesResponse] = await Promise.all([
+          fetch('/api/places'),
+          fetch('/api/listening-profiles'),
+        ])
+        const result = await readJson(placesResponse, 'Could not load saved places.')
+        const profileResult = await readJson(profilesResponse, 'Could not load listening profiles.')
         if (!cancelled) {
           setPlaces(result.places)
+          profilesRef.current = profileResult.profiles
+          setProfileState({ profiles: profileResult.profiles, error: '' })
           await requestRecommendations()
         }
       } catch (loadError) {
@@ -304,9 +370,10 @@ function Recommendations({ connected, historyVersion }) {
       </div>
 
       {error && <p className="status-message error-message" role="alert">{error}</p>}
+      {profileState.error && <p className="status-message error-message" role="alert">{profileState.error}</p>}
       {status && <p className="status-message">{status}</p>}
       <label className="field context-place">
-        Listening context
+        Saved place
         <select
           value={placeId}
           onChange={(event) => {
@@ -319,6 +386,53 @@ function Recommendations({ connected, historyVersion }) {
           {places.map((place) => <option key={place.id} value={place.id}>{place.name}</option>)}
         </select>
       </label>
+      <label className="field context-place">
+        Listening mode
+        <select
+          value={listeningMode}
+          onChange={(event) => {
+            const mode = event.target.value
+            selectedMode.current = mode
+            setListeningMode(mode)
+            void requestRecommendations(placeId, mode)
+          }}
+        >
+          <option value="">No listening profile</option>
+          {LISTENING_MODES.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+        </select>
+      </label>
+      <details className="profile-setup">
+        <summary>Edit listening profiles</summary>
+        <p>Enter one preferred track per line as <code>Song — Artist</code>. Save profiles to your account to use them on your other signed-in devices. Track names are sent with recommendation requests but aren’t stored in the repository or recommendation history.</p>
+        {LISTENING_MODES.map(({ id, label }) => (
+          <label className="profile-editor" key={id}>
+            {label} artists
+            <textarea
+              value={profiles[id]}
+              onChange={(event) => updateProfile(id, event.target.value)}
+              placeholder={'Breadcrumbs — Isabella Contadini'}
+              rows={3}
+            />
+          </label>
+        ))}
+        <button
+          className="connect-button secondary"
+          type="button"
+          onClick={() => void saveProfiles()}
+          disabled={savingProfiles}
+        >
+          {savingProfiles ? 'Saving profiles…' : 'Save profiles and apply'}
+        </button>
+        {profileStatus && <p className="status-message" role="status">{profileStatus}</p>}
+        <button
+          className="connect-button secondary"
+          type="button"
+          onClick={() => void requestRecommendations()}
+          disabled={loading}
+        >
+          Apply profile
+        </button>
+      </details>
       <div className="location-check-in">
         <button className="connect-button secondary" type="button" onClick={useCurrentLocation} disabled={locating}>
           {locating ? 'Checking location…' : 'Use my current location'}

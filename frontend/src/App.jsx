@@ -68,6 +68,7 @@ function App() {
   const [savedPlayCount, setSavedPlayCount] = useState(0)
   const [historyVersion, setHistoryVersion] = useState(0)
   const [connected, setConnected] = useState(false)
+  const [spotifyAccountId, setSpotifyAccountId] = useState('')
   const [section, setSection] = useState(() => {
     const hash = window.location.hash.slice(1)
     return SECTIONS.some((item) => item.id === hash) ? hash : 'overview'
@@ -169,8 +170,12 @@ function App() {
       const historyResponse = await fetch('/api/history?limit=500')
       const historyResult = await historyResponse.json()
       if (!historyResponse.ok) throw new Error(historyResult.detail || 'Could not load saved listening history.')
+      const accountResponse = await fetch('/api/account')
+      const accountResult = await accountResponse.json()
+      if (!accountResponse.ok) throw new Error(accountResult.detail || 'Could not load Spotify account information.')
       setTracks(result.tracks)
       setPlays(historyResult.plays)
+      setSpotifyAccountId(accountResult.spotify_user_id)
       setConnected(true)
       setLastSync(result.last_sync_at)
       setSavedPlayCount(historyResult.stats?.play_count ?? result.play_count)
@@ -196,6 +201,7 @@ function App() {
   async function disconnect() {
     await fetch('/logout', { method: 'POST' })
     setConnected(false)
+    setSpotifyAccountId('')
     setTracks([])
     setPlays([])
     setFavorites([])
@@ -250,6 +256,7 @@ function App() {
                 <section>
                   <h2>Your week in music</h2>
                   <p>A summary of the Spotify listening history you have synced with Aftertone.</p>
+                  {spotifyAccountId && <p className="stats-caption">Spotify account ID: <code>{spotifyAccountId}</code></p>}
                   <div className="history-sync">
                     <span>{savedPlayCount} plays saved · Last sync {lastSync ? new Date(lastSync).toLocaleString() : 'not yet'}</span>
                     <button className="connect-button secondary" type="button" onClick={syncHistory} disabled={loading}>

@@ -7,8 +7,12 @@ services:
     dockerContext: .
     healthCheckPath: /api/health
     envVars:
-      - key: AFTERTONE_DB
-        value: /tmp/aftertone.db
+      - key: DATABASE_URL
+        sync: false
+      - key: AFTERTONE_REQUIRE_ALLOWLIST
+        value: "true"
+      - key: AFTERTONE_REQUIRE_DATABASE
+        value: "true"
       - key: AFTERTONE_MODEL
         value: /tmp/recommender_model.json
       - key: FRONTEND_URL
@@ -20,4 +24,6 @@ services:
       - key: SPOTIFY_CLIENT_ID
         sync: false
       - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: AFTERTONE_ALLOWED_SPOTIFY_USERS
         sync: false

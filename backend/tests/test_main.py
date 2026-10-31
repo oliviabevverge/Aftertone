@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
-from app.main import SESSION_COOKIE, app, sessions
+from app.main import SESSION_COOKIE, _account_stores, app, sessions
 from app.store import ListeningStore
 
 
@@ -20,6 +20,15 @@ class SpotifyOAuthTests(unittest.TestCase):
         self.store_patch = patch("app.main.store", self.store)
         self.store_patch.start()
         self.addCleanup(self.store_patch.stop)
+        _account_stores.clear()
+        self.addCleanup(_account_stores.clear)
+        self.account_db_dir = Path(self.tmpdir.name) / "accounts"
+        self.account_db_env = patch.dict(
+            "os.environ",
+            {"AFTERTONE_ACCOUNT_DB_DIR": str(self.account_db_dir)},
+        )
+        self.account_db_env.start()
+        self.addCleanup(self.account_db_env.stop)
         self.client = TestClient(app, follow_redirects=False)
         self.config = patch(
             "app.main.spotify_config",
@@ -36,7 +45,7 @@ class SpotifyOAuthTests(unittest.TestCase):
         state = authorize_params["state"][0]
         self.assertEqual(
             set(authorize_params["scope"][0].split()),
-            {"user-read-recently-played"},
+            {"user-read-private", "user-read-recently-played"},
         )
 
         token_response = Mock()
@@ -46,11 +55,16 @@ class SpotifyOAuthTests(unittest.TestCase):
             "expires_in": 3600,
         }
         token_response.raise_for_status.return_value = None
+        account_response = Mock()
+        account_response.json.return_value = {"id": "test-spotify-account"}
+        account_response.status_code = 200
+        account_response.raise_for_status.return_value = None
         with patch("app.main.httpx.post", return_value=token_response) as post:
-            callback = self.client.get(
-                "/callback",
-                params={"code": "one-time-code", "state": state},
-            )
+            with patch("app.main.httpx.get", return_value=account_response):
+                callback = self.client.get(
+                    "/callback",
+                    params={"code": "one-time-code", "state": state},
+                )
 
         self.assertEqual(callback.status_code, 307)
         self.assertIn("spotify_connected=1", callback.headers["location"])
@@ -77,14 +91,15 @@ class SpotifyOAuthTests(unittest.TestCase):
         }
         spotify_response.status_code = 200
         spotify_response.raise_for_status.return_value = None
-        self.client.cookies.update(callback.cookies)
         with patch("app.main.httpx.get", return_value=spotify_response):
             recent = self.client.get("/api/recently-played")
 
         self.assertEqual(recent.status_code, 200)
         self.assertEqual(recent.json()["tracks"][0]["name"], "Track title")
         self.assertEqual(recent.json()["tracks"][0]["artists"], ["Artist"])
-        self.assertEqual(self.store.list_plays()[0]["name"], "Track title")
+        from app.main import account_store
+
+        self.assertEqual(account_store("test-spotify-account").list_plays()[0]["name"], "Track title")
 
         recs = self.client.post(
             "/api/recommendations",
@@ -114,6 +129,64 @@ class SpotifyOAuthTests(unittest.TestCase):
         )
         self.assertEqual(settings.status_code, 200)
         self.assertEqual(settings.json()["settings"]["sequence_weight"], 1.5)
+
+    def test_listening_profiles_are_scoped_to_spotify_account(self) -> None:
+        from app.main import _account_stores, account_store
+
+        self.addCleanup(lambda: _account_stores.clear())
+        self.client.cookies.set(SESSION_COOKIE, "profile-account-one")
+        sessions["profile-account-one"] = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "expires_at": time.time() + 3600,
+            "spotify_user_id": "spotify-account-one",
+        }
+        sessions["profile-account-two"] = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "expires_at": time.time() + 3600,
+            "spotify_user_id": "spotify-account-two",
+        }
+        self.addCleanup(lambda: sessions.pop("profile-account-one", None))
+        self.addCleanup(lambda: sessions.pop("profile-account-two", None))
+
+        saved = self.client.put(
+            "/api/listening-profiles",
+            json={
+                "office": "Breadcrumbs — Isabella Contadini",
+                "gym": "",
+                "car": "",
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        self.client.cookies.set(SESSION_COOKIE, "profile-account-two")
+        other_account = self.client.get("/api/listening-profiles")
+        self.assertEqual(other_account.status_code, 200)
+        self.assertEqual(other_account.json()["profiles"]["office"], "")
+
+        self.client.cookies.set(SESSION_COOKIE, "profile-account-one")
+        same_account = self.client.get("/api/listening-profiles")
+        self.assertEqual(
+            same_account.json()["profiles"]["office"],
+            "Breadcrumbs — Isabella Contadini",
+        )
+
+    def test_invite_allowlist_rejects_uninvited_spotify_accounts(self) -> None:
+        from app.main import authorize_spotify_user
+
+        with patch.dict(
+            "os.environ",
+            {
+                "AFTERTONE_ALLOWED_SPOTIFY_USERS": "invited-account",
+                "AFTERTONE_REQUIRE_ALLOWLIST": "true",
+            },
+        ):
+            from fastapi import HTTPException
+
+            with self.assertRaises(HTTPException) as raised:
+                authorize_spotify_user("uninvited-account")
+        self.assertEqual(raised.exception.status_code, 403)
 
     def test_callback_rejects_mismatched_state(self) -> None:
         self.client.get("/login")
@@ -158,10 +231,20 @@ class SpotifyOAuthTests(unittest.TestCase):
         )
         response = self.client.post(
             "/api/recommendations",
-            json={"hour": 8, "weekday": 3, "seed_track_ids": ["opener"], "limit": 5},
+            json={
+                "hour": 8,
+                "weekday": 3,
+                "listening_mode": "gym",
+                "preferred_tracks": [{"name": "Morning Hit", "artist": "A"}],
+                "seed_track_ids": ["opener"],
+                "limit": 5,
+            },
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["recommendations"][0]["track"]["id"], "morning-hit")
+        self.assertEqual(response.json()["context"]["listening_mode"], "gym")
+        self.assertEqual(response.json()["recommendations"][0]["parts"]["profile_artist"], 1.0)
+        self.assertIn("listening profile", response.json()["ranking_model"])
         self.addCleanup(lambda: sessions.pop("test-session", None))
 
     def test_live_location_sync_tags_new_plays_at_saved_place(self) -> None:

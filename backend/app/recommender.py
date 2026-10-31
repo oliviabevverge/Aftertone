@@ -38,6 +38,46 @@ def min_max(values: list[float]) -> list[float]:
     return [(value - low) / (high - low) for value in values]
 
 
+def rerank_with_listening_profile(
+    recommendations: list[dict[str, Any]],
+    preferred_tracks: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    if not recommendations or not preferred_tracks:
+        return recommendations
+
+    def normalize(value: str) -> str:
+        return " ".join(value.casefold().split())
+
+    preferred_artists = {
+        normalize(track["artist"])
+        for track in preferred_tracks
+        if track["artist"].strip()
+    }
+    preferred_songs = {
+        (normalize(track["name"]), normalize(track["artist"]))
+        for track in preferred_tracks
+        if track["name"].strip() and track["artist"].strip()
+    }
+    scores = [item["score"] for item in recommendations]
+    low, high = min(scores), max(scores)
+
+    for item in recommendations:
+        track = item["track"]
+        artists = {normalize(artist) for artist in track.get("artists", [])}
+        artist_match = len(artists & preferred_artists) / len(preferred_artists)
+        exact_match = any(
+            (normalize(track["name"]), artist) in preferred_songs
+            for artist in artists
+        )
+        baseline = (item["score"] - low) / (high - low) if high > low else 0.5
+        profile_match = min(1.0, 0.6 * artist_match + 0.4 * exact_match)
+        item["parts"]["profile_artist"] = round(profile_match, 4)
+        item["score"] = round(0.45 * baseline + 0.55 * profile_match, 4)
+
+    recommendations.sort(key=lambda item: item["score"], reverse=True)
+    return recommendations
+
+
 def sessions_from_plays(
     plays_oldest_first: list[dict[str, Any]],
     gap_minutes: float,
