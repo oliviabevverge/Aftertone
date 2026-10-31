@@ -39,7 +39,7 @@ class PostgresRow(dict[str, Any]):
 
 
 def postgres_row_factory(cursor: Any) -> Any:
-    columns = [column.name for column in cursor.description]
+    columns = [column.name for column in cursor.description] if cursor.description else []
     return lambda values: PostgresRow(zip(columns, values))
 
 

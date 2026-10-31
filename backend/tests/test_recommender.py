@@ -1,10 +1,16 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 
 from app.recommender import recommend, rerank_with_listening_profile
-from app.store import DEFAULT_SETTINGS, ListeningStore, adapt_postgres_query
+from app.store import (
+    DEFAULT_SETTINGS,
+    ListeningStore,
+    adapt_postgres_query,
+    postgres_row_factory,
+)
 from train_model import train
 
 
@@ -216,6 +222,11 @@ class RecommenderTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_postgres_row_factory_handles_commands_without_result_columns(self) -> None:
+        make_row = postgres_row_factory(SimpleNamespace(description=None))
+
+        self.assertEqual(make_row(()), {})
+
     def test_sqlite_import_preserves_history_places_and_profiles(self) -> None:
         with TemporaryDirectory() as tmp:
             source_path = Path(tmp) / "local.db"
